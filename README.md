@@ -2,6 +2,48 @@
 
 CSV/XLSXと関連資料をカレントディレクトリから安全に探索し、質問、計画承認、前処理、EDA、因果推論、検証、レポートまでを再開可能なLangGraphワークフローで実行します。外部LLMはMVPでは使用せず、データや関連コードを外部送信・自動実行しません。
 
+## 処理フロー
+
+```mermaid
+flowchart TB
+    A([data-agent run / Streamlit]) --> B[CSV・XLSXと関連資料を探索]
+    B --> C[軽量メタデータ確認・分析可能性評価]
+    C --> D[依頼文を構造化]
+    D --> E{必須情報は揃ったか}
+    E -->|いいえ| F[適応的な質問]
+    F --> E
+    E -->|はい| G[分析計画を生成]
+    G --> H{計画を承認するか}
+    H -->|差し戻し| F
+    H -->|承認| I[データ読込・前処理]
+    I --> J[データ検証]
+    J --> K{検証合格}
+    K -->|不合格| R[失敗分類・局所Retry]
+    R -->|上限以内| I
+    R -->|上限超過| X[Human Review]
+    K -->|合格| L[EDA・基本統計・可視化]
+    L --> M[計算結果の整合性検証]
+    M --> N{中間結果を承認するか}
+    N -->|差し戻し| F
+    N -->|承認| O[Causal Specialist]
+    O --> P{識別条件・専門分析検証に合格}
+    P -->|不合格| R
+    P -->|合格または適用外理由を確定| Q[検証済み成果物からレポート生成]
+    Q --> S[Markdown・HTML・Streamlit表示]
+    S --> T([Checkpoint・履歴・成果物を保存して完了])
+
+    classDef human fill:#fff2df,stroke:#b7791f,color:#593d12
+    class F,H,N,X human
+```
+
+質問、計画承認、中間結果確認では処理を一時停止します。`run_id` と同じ `thread_id` を使って再開でき、検証エラー時は失敗した処理だけを設定回数まで再実行します。
+
+## 画面イメージ
+
+以下は、同梱の合成売上データを分析した完了RunをStreamlitで表示した画面です。
+
+![Streamlitの最終分析レポート画面](docs/images/streamlit-dashboard.png)
+
 ## クイックスタート
 
 Python 3.10以上を使用してください。

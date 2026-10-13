@@ -167,7 +167,10 @@ runs = RunStore.list_runs(PROJECT_ROOT / settings.runs_dir)
 with st.sidebar:
     st.header("Run")
     run_ids = [row["run_id"] for row in runs]
-    selected = st.selectbox("保存済みRun", ["新規"] + run_ids)
+    run_options = ["新規"] + run_ids
+    requested_run_id = st.query_params.get("run_id")
+    selected_index = run_options.index(requested_run_id) if requested_run_id in run_options else 0
+    selected = st.selectbox("保存済みRun", run_options, index=selected_index)
     if selected == "新規":
         request = st.text_area("分析依頼", "売上データの傾向を把握したい")
         allow_outside = st.checkbox("依頼文に記載したcwd外のパス参照を明示的に許可")
