@@ -1,0 +1,19 @@
+max_file_size_mb: 100
+metadata_sample_rows: 200
+max_supporting_file_kb: 256
+max_questions_per_round: 4
+max_question_rounds: 5
+max_retries: 2
+random_seed: 42
+missing_strategy: keep
+duplicate_strategy: drop
+runs_dir: runs
+phase_weights:
+  discovery: 10
+  questions: 15
+  planning: 10
+  preprocessing: 15
+  eda: 20
+  specialist: 15
+  reporting: 15
+

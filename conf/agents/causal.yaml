@@ -1,0 +1,5 @@
+provider: deterministic
+supported_methods:
+  - regression_adjustment
+  - difference_in_differences
+
