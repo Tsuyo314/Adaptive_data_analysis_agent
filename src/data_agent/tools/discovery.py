@@ -12,7 +12,16 @@ import yaml
 
 from data_agent.config import Settings
 
-EXCLUDED_PARTS = {".git", ".venv", "venv", "node_modules", "runs", "mlruns", "__pycache__"}
+EXCLUDED_PARTS = {
+    ".data-agent",
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "runs",
+    "mlruns",
+    "__pycache__",
+}
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -87,11 +96,11 @@ def select_dataset(
         if explicit.suffix.lower() not in {".csv", ".xlsx"}:
             raise ValueError("主データはCSVまたはXLSXである必要があります")
         if not _is_allowed_path(explicit, workspace) and not allow_outside_workspace:
-            raise PermissionError("cwd外のデータ参照には明示承認が必要です")
+            raise PermissionError("workspace外のデータ参照には明示承認が必要です")
         return explicit
     candidates = [Path(item["path"]) for item in manifest["data_files"] if item["eligible"]]
     if not candidates:
-        raise FileNotFoundError("cwd配下に読み込み可能なCSV/XLSXがありません")
+        raise FileNotFoundError("workspace配下に読み込み可能なCSV/XLSXがありません")
     if len(candidates) == 1:
         return candidates[0]
     # Prefer files close to the workspace root; ties are stable and explicit in the manifest.

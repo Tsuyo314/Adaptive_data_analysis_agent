@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,14 @@ from data_agent.schemas import Question
 from data_agent.storage import RunStore
 from data_agent.tools.discovery import resolve_explicit_dataset
 from data_agent.tools.questions import ask_interactively
+from data_agent.workspace import (
+    default_analysis_root,
+    initialize_workspace,
+    list_projects,
+    list_workspace_runs,
+    project_path,
+    resolve_runs_root,
+)
 
 app = typer.Typer(help="Adaptive Data Analysis Agent")
 console = Console()
@@ -28,6 +38,39 @@ PROVIDER_LABELS = {
     "openrouter": "OpenRouter API",
     "deterministic": "AIなし（決定論モード）",
 }
+LLM_TASK_LABELS = {
+    "question_planner": "確認事項の整理",
+    "analysis_planner": "分析計画の作成",
+    "reflector": "エラーと再開方法の検討",
+    "reporter": "レポート要約の作成",
+}
+
+
+@contextmanager
+def _llm_activity(task: str, attempt: int):
+    action = LLM_TASK_LABELS.get(task, "応答の生成")
+    retry = "（応答を修復中）" if attempt > 1 else ""
+    running_message = f"AIが{action}を実行しています{retry}..."
+    started = time.monotonic()
+    try:
+        if console.is_terminal:
+            with console.status(
+                f"[bold cyan]{running_message}[/bold cyan]",
+                spinner="arc",
+                spinner_style="bold cyan",
+                refresh_per_second=12.5,
+            ):
+                yield
+        else:
+            console.print(f"[cyan]↻ {running_message}[/cyan]")
+            yield
+    except Exception:
+        elapsed = time.monotonic() - started
+        console.print(f"[red]✗ AIによる{action}に失敗しました（{elapsed:.1f}秒）[/red]")
+        raise
+    else:
+        elapsed = time.monotonic() - started
+        console.print(f"[green]✓ AIによる{action}が完了しました（{elapsed:.1f}秒）[/green]")
 
 
 def _choose_numbered(label: str, values: list[tuple[str, str]], default_id: str | None) -> str:
@@ -53,6 +96,44 @@ def _select_provider(requested: str | None, preferences: Preferences) -> str:
     previous, _ = preferences.last_selection()
     choices = [(key, label) for key, label in PROVIDER_LABELS.items()]
     return _choose_numbered("使用するAI", choices, previous)
+
+
+def _select_workspace(workspace: Path | None, project: str | None) -> Path:
+    if workspace and project:
+        raise typer.BadParameter("--workspaceと--projectは同時に指定できません")
+    if workspace:
+        return workspace.resolve()
+
+    analysis_root = default_analysis_root()
+    if project:
+        selected = project_path(Path(project), analysis_root)
+        if not selected.is_dir():
+            raise typer.BadParameter(
+                f"分析プロジェクトが見つかりません: {selected}\n"
+                f"先に data-agent init {project} を実行してください。"
+            )
+        return selected
+
+    projects = list_projects(analysis_root)
+    current = Path.cwd().resolve()
+    for candidate in projects:
+        if current == candidate or candidate in current.parents:
+            return candidate
+    if not projects:
+        console.print(
+            f"[red]分析プロジェクトがありません: {analysis_root}[/red]\n"
+            "先に [bold]data-agent init <プロジェクト名>[/bold] を実行してください。"
+        )
+        raise typer.Exit(code=1)
+    if len(projects) == 1:
+        console.print(f"分析プロジェクト: [bold]{projects[0].name}[/bold]")
+        return projects[0]
+    selected = _choose_numbered(
+        "分析プロジェクト",
+        [(str(candidate), candidate.name) for candidate in projects],
+        None,
+    )
+    return Path(selected)
 
 
 def _ensure_consent(provider: str, settings: Settings, preferences: Preferences) -> None:
@@ -99,15 +180,23 @@ def _connect_provider(
         preferences.remember_selection(provider_name)
         return None, ""
     if provider_name == "chatgpt":
-        console.print("[bold]Continue with ChatGPT[/bold] — ブラウザでサインインしてください。")
-        auth = ChatGPTAuthClient(preferences=preferences, timeout=settings.llm.timeout_seconds)
+        auth = ChatGPTAuthClient(
+            preferences=preferences,
+            timeout=settings.llm.timeout_seconds,
+            reauth_days=settings.llm.chatgpt_reauth_days,
+        )
         tokens = auth.authenticate()
         provider = ChatGPTProvider(
             auth,
             base_url=settings.llm.openai_base_url,
             timeout=settings.llm.timeout_seconds,
         )
-        console.print(f"[green]Using ChatGPT plan[/green] {tokens.email or tokens.subject}")
+        source = "保存済み認証" if auth.reused_session else "ブラウザ認証"
+        console.print(
+            f"[green]Using ChatGPT plan[/green] {tokens.email or tokens.subject}（{source}）"
+        )
+        if auth.revocation_warning:
+            console.print(f"[yellow]{auth.revocation_warning}[/yellow]")
         console.print("Manage usage: https://chatgpt.com/settings/usage")
     else:
         provider = OpenRouterProvider(
@@ -229,7 +318,12 @@ def _drive(pipeline: Pipeline) -> None:
                 console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(code=2) from exc
             service = (
-                LLMService(provider, pipeline.store, pipeline.settings.llm.max_attempts)
+                LLMService(
+                    provider,
+                    pipeline.store,
+                    pipeline.settings.llm.max_attempts,
+                    activity=_llm_activity,
+                )
                 if provider
                 else None
             )
@@ -240,16 +334,42 @@ def _drive(pipeline: Pipeline) -> None:
         previous_status = status
 
 
+@app.command("init")
+def init_workspace(
+    directory: Path = typer.Argument(
+        ..., help="プロジェクト名、または明示的な分析workspaceのパス"
+    ),
+) -> None:
+    """入力、関連資料、Run成果物を分離した分析workspaceを作成します。"""
+    workspace = initialize_workspace(project_path(directory))
+    console.print(
+        Panel(
+            f"[bold]{workspace}[/bold]\n"
+            "├── data/             CSV・XLSX\n"
+            "├── references/       README・仕様書など\n"
+            "└── .data-agent/runs/ Run成果物（Git対象外）\n\n"
+            "実行: data-agent run",
+            title="分析workspaceを初期化しました",
+        )
+    )
+
+
 @app.command()
 def run(
     request: str | None = typer.Argument(None, help="分析依頼。省略時は起動後に入力"),
-    workspace: Path = typer.Option(Path.cwd(), exists=True, file_okay=False, resolve_path=True),
+    workspace: Path | None = typer.Option(
+        None, exists=True, file_okay=False, resolve_path=True, help="分析workspaceの明示パス"
+    ),
+    project: str | None = typer.Option(
+        None, "--project", "-p", help="data-analysis配下のプロジェクト名"
+    ),
     provider: str | None = typer.Option(
         None, "--provider", help="chatgpt、openrouter、deterministic。省略時は対話選択"
     ),
     model: str | None = typer.Option(None, "--model", help="ライブ一覧にあるモデルID"),
 ) -> None:
     """新しい分析Runを開始します。"""
+    workspace = _select_workspace(workspace, project)
     if request is None:
         console.print(
             Panel(
@@ -268,7 +388,7 @@ def run(
             explicit.relative_to(workspace.resolve())
         except ValueError:
             allow_outside = typer.confirm(
-                f"cwd外のファイルを参照します: {explicit}\n明示的に許可しますか？",
+                f"workspace外のファイルを参照します: {explicit}\n明示的に許可しますか？",
                 default=False,
             )
             if not allow_outside:
@@ -293,7 +413,10 @@ def run(
     )
     if connected_provider:
         pipeline.llm_service = LLMService(
-            connected_provider, pipeline.store, settings.llm.max_attempts
+            connected_provider,
+            pipeline.store,
+            settings.llm.max_attempts,
+            activity=_llm_activity,
         )
     console.print(f"Run ID: [bold]{pipeline.state['run_id']}[/bold]")
     _drive(pipeline)
@@ -302,9 +425,15 @@ def run(
 @app.command()
 def resume(
     run_id: str = typer.Argument(..., help="再開するrun_id"),
-    workspace: Path = typer.Option(Path.cwd(), exists=True, file_okay=False, resolve_path=True),
+    workspace: Path | None = typer.Option(
+        None, exists=True, file_okay=False, resolve_path=True, help="分析workspaceの明示パス"
+    ),
+    project: str | None = typer.Option(
+        None, "--project", "-p", help="data-analysis配下のプロジェクト名"
+    ),
 ) -> None:
     """同一thread_idのチェックポイントから再開します。"""
+    workspace = _select_workspace(workspace, project)
     pipeline = Pipeline.resume(run_id, workspace=workspace)
     provider_name = pipeline.state.get("llm_provider", "deterministic")
     model = pipeline.state.get("llm_model") or None
@@ -326,7 +455,12 @@ def resume(
                 console.print(f"[red]AI再接続エラー: {retry_exc}[/red]")
                 raise typer.Exit(code=2) from retry_exc
         pipeline.llm_service = (
-            LLMService(connected, pipeline.store, pipeline.settings.llm.max_attempts)
+            LLMService(
+                connected,
+                pipeline.store,
+                pipeline.settings.llm.max_attempts,
+                activity=_llm_activity,
+            )
             if connected
             else None
         )
@@ -336,12 +470,18 @@ def resume(
 
 @app.command("list-runs")
 def list_runs(
-    workspace: Path = typer.Option(Path.cwd(), exists=True, file_okay=False, resolve_path=True),
+    workspace: Path | None = typer.Option(
+        None, exists=True, file_okay=False, resolve_path=True, help="分析workspaceの明示パス"
+    ),
+    project: str | None = typer.Option(
+        None, "--project", "-p", help="data-analysis配下のプロジェクト名"
+    ),
 ) -> None:
     """保存済みRunを一覧表示します。"""
+    workspace = _select_workspace(workspace, project)
     settings = Settings.load(workspace / "conf/config.yaml")
     table = Table("run_id", "status", "updated_at", "working_directory")
-    for row in RunStore.list_runs(workspace / settings.runs_dir):
+    for row in list_workspace_runs(workspace, settings):
         table.add_row(row["run_id"], row["status"], row["updated_at"], row["working_directory"])
     console.print(table)
 
@@ -382,11 +522,17 @@ def graph(
 @app.command()
 def status(
     run_id: str,
-    workspace: Path = typer.Option(Path.cwd(), exists=True, file_okay=False, resolve_path=True),
+    workspace: Path | None = typer.Option(
+        None, exists=True, file_okay=False, resolve_path=True, help="分析workspaceの明示パス"
+    ),
+    project: str | None = typer.Option(
+        None, "--project", "-p", help="data-analysis配下のプロジェクト名"
+    ),
 ) -> None:
     """Runの最新StateをJSON表示します。"""
+    workspace = _select_workspace(workspace, project)
     settings = Settings.load(workspace / "conf/config.yaml")
-    store = RunStore(workspace / settings.runs_dir, run_id)
+    store = RunStore(resolve_runs_root(workspace, settings, run_id), run_id)
     console.print_json(json.dumps(store.load_state(), ensure_ascii=False))
 
 

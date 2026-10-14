@@ -5,7 +5,7 @@ from data_agent.specialists.causal import run_causal_analysis
 
 def _answers(assumption=True):
     return {
-        "analysis_scope": {"value": "因果効果の推定"},
+        "analysis_scope": {"value": ["傾向把握・記述統計", "因果効果の推定"]},
         "target_column": {"value": "y"},
         "treatment_column": {"value": "t"},
         "treatment_value": {"value": "1"},

@@ -32,6 +32,7 @@ from data_agent.validators.core import (
     validate_final,
     validate_results,
 )
+from data_agent.workspace import primary_runs_root, resolve_runs_root
 
 
 class Pipeline:
@@ -95,7 +96,7 @@ class Pipeline:
             "llm_status": "disabled" if llm_provider == "deterministic" else "ready",
             "llm_calls": [],
         }
-        store = RunStore(workspace / settings.runs_dir, run_id)
+        store = RunStore(primary_runs_root(workspace, settings), run_id)
         store.initialize(state, config=asdict(settings))
         return cls(state, settings, store, llm_service)
 
@@ -109,7 +110,7 @@ class Pipeline:
     ) -> Pipeline:
         workspace = (workspace or Path.cwd()).resolve()
         settings = settings or Settings.load(workspace / "conf/config.yaml")
-        store = RunStore(workspace / settings.runs_dir, run_id)
+        store = RunStore(resolve_runs_root(workspace, settings, run_id), run_id)
         return cls(store.load_state(), settings, store, llm_service)
 
     def select_llm_provider(
@@ -448,19 +449,19 @@ class Pipeline:
     def _extract_request_answers(request: str, columns: list[str]) -> dict[str, dict[str, Any]]:
         """Extract only high-confidence values; uncertain values remain unanswered."""
         lowered = request.lower()
-        scope: str | None = None
+        scopes: list[str] = []
+        if any(token in request for token in ("傾向", "記述統計", "概要")):
+            scopes.append("傾向把握・記述統計")
+        if "品質" in request or "quality" in lowered:
+            scopes.append("データ品質確認")
         if "因果" in request or "causal" in lowered:
-            scope = "因果効果の推定"
-        elif "品質" in request or "quality" in lowered:
-            scope = "データ品質確認"
-        elif any(token in request for token in ("傾向", "記述統計", "概要")):
-            scope = "傾向把握・記述統計"
+            scopes.append("因果効果の推定")
         extracted: dict[str, dict[str, Any]] = {}
-        if scope:
+        if scopes:
             extracted["analysis_scope"] = {
                 "question_id": "analysis_scope",
                 "choice": "extracted",
-                "value": scope,
+                "value": scopes,
                 "notes": ["依頼文から高確度で抽出。計画承認時に修正可能"],
             }
         mentioned = [column for column in columns if str(column).lower() in lowered]
@@ -524,7 +525,12 @@ class Pipeline:
                 outputs=["analysis/descriptive.json", "visualizations/*.html"],
             ),
         ]
-        if scope in {"因果効果の推定", "傾向把握と因果効果"}:
+        includes_causal = (
+            "因果効果の推定" in scope
+            if isinstance(scope, list)
+            else scope in {"因果効果の推定", "傾向把握と因果効果"}
+        )
+        if includes_causal:
             steps.append(
                 PlanStep(
                     id="causal",

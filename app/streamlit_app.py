@@ -23,6 +23,11 @@ from data_agent.llm.providers import ChatGPTProvider, OpenRouterProvider  # noqa
 from data_agent.pipeline import Pipeline  # noqa: E402
 from data_agent.schemas import Question, QuestionKind  # noqa: E402
 from data_agent.storage import RunStore  # noqa: E402
+from data_agent.workspace import (  # noqa: E402
+    default_analysis_root,
+    list_projects,
+    list_workspace_runs,
+)
 
 st.set_page_config(page_title="Adaptive Data Analysis Agent", page_icon="📊", layout="wide")
 settings = Settings.load(PROJECT_ROOT / "conf/config.yaml")
@@ -32,10 +37,11 @@ PROVIDER_LABELS = {
     "openrouter": "OpenRouter API",
     "deterministic": "AIなし",
 }
+DEFAULT_ANALYSIS_ROOT = default_analysis_root()
 
 
 def load_pipeline(run_id: str) -> Pipeline:
-    pipeline = Pipeline.resume(run_id, workspace=PROJECT_ROOT, settings=settings)
+    pipeline = Pipeline.resume(run_id, workspace=analysis_workspace, settings=settings)
     provider = st.session_state.get("llm_provider_object")
     if provider and provider.name == pipeline.state.get("llm_provider"):
         provider.model = pipeline.state.get("llm_model", "")
@@ -78,7 +84,9 @@ def provider_controls(prefix: str, initial: str | None = None) -> tuple[str, Any
         try:
             if provider_name == "chatgpt":
                 auth = ChatGPTAuthClient(
-                    preferences=preferences, timeout=settings.llm.timeout_seconds
+                    preferences=preferences,
+                    timeout=settings.llm.timeout_seconds,
+                    reauth_days=settings.llm.chatgpt_reauth_days,
                 )
                 tokens = auth.authenticate()
                 provider = ChatGPTProvider(
@@ -87,6 +95,11 @@ def provider_controls(prefix: str, initial: str | None = None) -> tuple[str, Any
                     timeout=settings.llm.timeout_seconds,
                 )
                 st.session_state[f"{prefix}-account"] = tokens.email or tokens.subject
+                st.session_state[f"{prefix}-auth-source"] = (
+                    "保存済み認証" if auth.reused_session else "ブラウザ認証"
+                )
+                if auth.revocation_warning:
+                    st.warning(auth.revocation_warning)
             else:
                 provider = OpenRouterProvider(
                     base_url=settings.llm.openrouter_base_url,
@@ -103,7 +116,9 @@ def provider_controls(prefix: str, initial: str | None = None) -> tuple[str, Any
     if not connected or connected.name != provider_name:
         return provider_name, None, "", False
     if provider_name == "chatgpt":
-        st.success(f"Using ChatGPT plan: {st.session_state.get(f'{prefix}-account', '接続済み')}")
+        account = st.session_state.get(f"{prefix}-account", "接続済み")
+        auth_source = st.session_state.get(f"{prefix}-auth-source", "認証済み")
+        st.success(f"Using ChatGPT plan: {account}（{auth_source}）")
         st.link_button("Manage usage", "https://chatgpt.com/settings/usage")
     models = st.session_state.get(f"{prefix}-models", [])
     ids = [item.id for item in models]
@@ -181,6 +196,14 @@ def render_questions(pipeline: Pipeline) -> None:
                 choices = [f"{index}. {label}" for index, label in enumerate(question.choices, 1)]
                 values[question.id] = st.selectbox("番号で選択", choices, key=f"q-{question.id}")
                 notes[question.id] = st.text_input("0. 補足情報（任意）", key=f"note-{question.id}")
+            elif question.kind == QuestionKind.MULTI_CHOICE:
+                choices = [f"{index}. {label}" for index, label in enumerate(question.choices, 1)]
+                values[question.id] = st.multiselect(
+                    "複数選択できます",
+                    choices,
+                    key=f"q-{question.id}",
+                )
+                notes[question.id] = st.text_input("補足情報（任意）", key=f"note-{question.id}")
             else:
                 values[question.id] = st.text_input("回答", key=f"q-{question.id}")
         submitted = st.form_submit_button("回答を保存", type="primary")
@@ -195,6 +218,13 @@ def render_questions(pipeline: Pipeline) -> None:
                 number = int(raw.split(".", 1)[0])
                 value = question.choices[number - 1]
                 choice = str(number)
+            elif question.kind == QuestionKind.MULTI_CHOICE:
+                if not raw:
+                    st.error(f"「{question.text}」で少なくとも1つ選択してください。")
+                    return
+                numbers = [int(item.split(".", 1)[0]) for item in raw]
+                value = [question.choices[number - 1] for number in numbers]
+                choice = ",".join(str(number) for number in numbers)
             else:
                 value = raw.strip() or "unknown"
                 choice = value
@@ -265,7 +295,40 @@ def render_report(pipeline: Pipeline) -> None:
 st.title("Adaptive Data Analysis Agent")
 st.caption("検証済み成果物を唯一の表示元とするHuman-in-the-loop分析")
 
-runs = RunStore.list_runs(PROJECT_ROOT / settings.runs_dir)
+with st.sidebar:
+    st.header("分析プロジェクト")
+    analysis_root_input = st.text_input(
+        "data-analysisフォルダ",
+        str(DEFAULT_ANALYSIS_ROOT),
+        help="案件ごとのプロジェクトフォルダを置く親フォルダです。",
+    )
+
+analysis_root = Path(analysis_root_input).expanduser().resolve()
+if not analysis_root.is_dir():
+    st.error(
+        f"data-analysisフォルダが見つかりません: {analysis_root}\n\n"
+        "先に `data-agent init <プロジェクト名>` で作成してください。"
+    )
+    st.stop()
+
+projects = list_projects(analysis_root)
+if not projects:
+    st.info(
+        "分析プロジェクトがまだありません。\n\n"
+        "`data-agent init <プロジェクト名>` で作成してください。"
+    )
+    st.stop()
+
+with st.sidebar:
+    selected_project = st.selectbox("プロジェクト", [path.name for path in projects])
+
+analysis_workspace = next(path for path in projects if path.name == selected_project)
+workspace_key = str(analysis_workspace)
+if st.session_state.get("active_workspace") != workspace_key:
+    st.session_state["active_workspace"] = workspace_key
+    st.session_state.pop("run_id", None)
+
+runs = list_workspace_runs(analysis_workspace, settings)
 with st.sidebar:
     st.header("Run")
     run_ids = [row["run_id"] for row in runs]
@@ -275,12 +338,14 @@ with st.sidebar:
     selected = st.selectbox("保存済みRun", run_options, index=selected_index)
     if selected == "新規":
         request = st.text_area("分析依頼", "売上データの傾向を把握したい")
-        allow_outside = st.checkbox("依頼文に記載したcwd外のパス参照を明示的に許可")
+        allow_outside = st.checkbox(
+            "依頼文に記載したworkspace外のパス参照を明示的に許可"
+        )
         provider_name, connected, selected_model, ready = provider_controls("new")
-        if st.button("cwdを探索して開始", type="primary", disabled=not ready):
+        if st.button("workspaceを探索して開始", type="primary", disabled=not ready):
             pipeline = Pipeline.create(
                 request,
-                workspace=PROJECT_ROOT,
+                workspace=analysis_workspace,
                 settings=settings,
                 allow_outside_workspace=allow_outside,
                 llm_provider=provider_name,

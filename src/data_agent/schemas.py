@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 class QuestionKind(str, Enum):
     YES_NO = "yes_no"
     NUMBERED_CHOICE = "numbered_choice"
+    MULTI_CHOICE = "multi_choice"
     FREE_TEXT = "free_text"
 
 
@@ -28,6 +29,8 @@ class Question(BaseModel):
             raise ValueError("yes_no questions must not define choices")
         if self.kind == QuestionKind.NUMBERED_CHOICE and len(self.choices) < 3:
             raise ValueError("numbered questions require at least three choices")
+        if self.kind == QuestionKind.MULTI_CHOICE and len(self.choices) < 2:
+            raise ValueError("multi-choice questions require at least two choices")
         return self
 
 

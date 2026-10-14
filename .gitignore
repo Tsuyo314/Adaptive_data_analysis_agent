@@ -7,6 +7,10 @@ __pycache__/
 .venv/
 .env
 .DS_Store
+.data-agent/
+**/.data-agent/
+data-analysis/*
+!data-analysis/README.md
 runs/*
 !runs/.gitkeep
 **/runs/*

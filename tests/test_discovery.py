@@ -11,6 +11,9 @@ from data_agent.tools.discovery import (
 
 def test_discovery_and_lightweight_inspection(tmp_path: Path):
     (tmp_path / "data.csv").write_text("x,y\n1,2\n3,\n", encoding="utf-8")
+    generated = tmp_path / ".data-agent" / "runs" / "old"
+    generated.mkdir(parents=True)
+    (generated / "generated.csv").write_text("secret\n1\n", encoding="utf-8")
     code = tmp_path / "helper.py"
     code.write_text("raise RuntimeError('must not execute')\n", encoding="utf-8")
     manifest = discover_workspace(tmp_path, Settings())

@@ -12,6 +12,7 @@ class LLMSettings:
     default_provider: str = "deterministic"
     timeout_seconds: float = 120.0
     max_attempts: int = 2
+    chatgpt_reauth_days: float = 1.0
     consent_policy_version: str = "1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openai_base_url: str = "https://api.openai.com/v1"
@@ -28,7 +29,7 @@ class Settings:
     random_seed: int = 42
     missing_strategy: str = "keep"
     duplicate_strategy: str = "drop"
-    runs_dir: str = "runs"
+    runs_dir: str = ".data-agent/runs"
     allowed_data_extensions: tuple[str, ...] = (".csv", ".xlsx")
     allowed_support_extensions: tuple[str, ...] = (
         ".md",

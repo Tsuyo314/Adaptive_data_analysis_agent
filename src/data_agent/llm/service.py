@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -13,6 +15,7 @@ from data_agent.llm.schemas import PlanProposal, QuestionSelection, ReportNarrat
 from data_agent.storage import RunStore
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+ActivityFactory = Callable[[str, int], AbstractContextManager[None]]
 
 TASK_INSTRUCTIONS = {
     "question_planner": (
@@ -37,10 +40,17 @@ class ProviderReselectionRequired(RuntimeError):
 
 
 class LLMService:
-    def __init__(self, provider: LLMProvider, store: RunStore, max_attempts: int = 2):
+    def __init__(
+        self,
+        provider: LLMProvider,
+        store: RunStore,
+        max_attempts: int = 2,
+        activity: ActivityFactory | None = None,
+    ):
         self.provider = provider
         self.store = store
         self.max_attempts = max(1, min(max_attempts, 2))
+        self.activity = activity
         self.last_audit_path: str | None = None
 
     def generate(
@@ -59,13 +69,15 @@ class LLMService:
         repair_error: str | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
-                generated = self.provider.generate_structured(
-                    task=task,
-                    instructions=TASK_INSTRUCTIONS[task],
-                    payload=payload,
-                    schema=schema,
-                    repair_error=repair_error,
-                )
+                activity = self.activity(task, attempt) if self.activity else nullcontext()
+                with activity:
+                    generated = self.provider.generate_structured(
+                        task=task,
+                        instructions=TASK_INSTRUCTIONS[task],
+                        payload=payload,
+                        schema=schema,
+                        repair_error=repair_error,
+                    )
                 validated = schema.model_validate(generated.value)
                 self._validate_semantics(validated, allowed_evidence, allowed_ids)
                 attempts.append({"attempt": attempt, "status": "completed"})

@@ -20,8 +20,8 @@ QUESTION_BANK = [
         id="analysis_scope",
         category="scope",
         text="今回の分析範囲を選択してください",
-        kind=QuestionKind.NUMBERED_CHOICE,
-        choices=["傾向把握・記述統計", "データ品質確認", "因果効果の推定", "傾向把握と因果効果"],
+        kind=QuestionKind.MULTI_CHOICE,
+        choices=["傾向把握・記述統計", "データ品質確認", "因果効果の推定"],
         completion_key="analysis_scope",
     ),
     Question(
@@ -89,9 +89,14 @@ def _answer_value(answers: dict[str, dict[str, Any]], question_id: str) -> Any:
 
 
 def is_applicable(question: Question, answers: dict[str, dict[str, Any]]) -> bool:
-    return all(
-        _answer_value(answers, key) in allowed for key, allowed in question.depends_on.items()
-    )
+    for key, allowed in question.depends_on.items():
+        value = _answer_value(answers, key)
+        if isinstance(value, list):
+            if not any(item in allowed for item in value):
+                return False
+        elif value not in allowed:
+            return False
+    return True
 
 
 def select_questions(answers: dict[str, dict[str, Any]], max_count: int = 4) -> list[Question]:
@@ -111,7 +116,15 @@ def parse_answer(
     """Return (answer, needs_note). A raw `0` reserves the next input for notes."""
     raw = raw.strip()
     notes = list(existing_notes or [])
-    if question.kind in {QuestionKind.YES_NO, QuestionKind.NUMBERED_CHOICE} and raw == "0":
+    if (
+        question.kind
+        in {
+            QuestionKind.YES_NO,
+            QuestionKind.NUMBERED_CHOICE,
+            QuestionKind.MULTI_CHOICE,
+        }
+        and raw == "0"
+    ):
         return None, True
     if question.kind == QuestionKind.YES_NO:
         normalized = raw.lower()
@@ -142,6 +155,26 @@ def parse_answer(
             ),
             False,
         )
+    if question.kind == QuestionKind.MULTI_CHOICE:
+        parts = [part for part in raw.replace("、", ",").replace("，", ",").split(",") if part]
+        try:
+            indices = [int(part.strip()) for part in parts]
+        except ValueError as exc:
+            raise ValueError("選択肢の番号をカンマ区切りで入力してください（例: 1,3）") from exc
+        indices = list(dict.fromkeys(indices))
+        if not indices:
+            raise ValueError("少なくとも1つ選択してください")
+        if any(index < 1 or index > len(question.choices) for index in indices):
+            raise ValueError(f"1〜{len(question.choices)}の番号を選択してください")
+        return (
+            Answer(
+                question_id=question.id,
+                choice=",".join(str(index) for index in indices),
+                value=[question.choices[index - 1] for index in indices],
+                notes=notes,
+            ),
+            False,
+        )
     value: Any = raw or "unknown"
     return Answer(question_id=question.id, choice=value, value=value, notes=notes), False
 
@@ -159,6 +192,11 @@ def ask_interactively(
         elif question.kind == QuestionKind.NUMBERED_CHOICE:
             for number, choice in enumerate(question.choices, start=1):
                 output_fn(f"  {number}. {choice}")
+            output_fn("  0. 補足情報を入力")
+        elif question.kind == QuestionKind.MULTI_CHOICE:
+            for number, choice in enumerate(question.choices, start=1):
+                output_fn(f"  {number}. {choice}")
+            output_fn("  複数選択: カンマ区切り（例: 1,3）")
             output_fn("  0. 補足情報を入力")
         try:
             answer, needs_note = parse_answer(question, input_fn("> "), notes)

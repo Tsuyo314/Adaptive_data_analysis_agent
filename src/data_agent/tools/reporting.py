@@ -2,8 +2,34 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 from typing import Any
+
+
+def _markdown_cell(value: Any) -> str:
+    if value is None:
+        return "—"
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _format_stat(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _markdown_cell(value)
+    return f"{number:,.6g}" if math.isfinite(number) else "—"
+
+
+def _format_count(value: Any) -> str:
+    if value is None:
+        return "0"
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError, OverflowError):
+        return _markdown_cell(value)
 
 
 def build_report_data(
@@ -86,22 +112,58 @@ def render_markdown(report: dict[str, Any]) -> str:
         ),
         f"完全重複行は {descriptive['duplicate_rows']:,} 行です。",
         "",
-        "## 基本統計",
+        "## 基礎統計量",
         "",
-        "| 列 | 件数 | 平均 | 標準偏差 | 最小 | 最大 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "### 数値列",
+        "",
     ]
-    for row in descriptive.get("numeric_summary", []):
-        lines.append(
-            "| {column} | {count:.0f} | {mean:.6g} | {std:.6g} | {min:.6g} | {max:.6g} |".format(
-                column=row.get("column", ""),
-                count=row.get("count", 0) or 0,
-                mean=row.get("mean", float("nan")) or 0,
-                std=row.get("std", float("nan")) or 0,
-                min=row.get("min", float("nan")) or 0,
-                max=row.get("max", float("nan")) or 0,
-            )
+    numeric_summary = descriptive.get("numeric_summary", [])
+    if numeric_summary:
+        lines.extend(
+            [
+                "| 列 | 有効件数 | 欠損数 | 平均 | 標準偏差 | 最小 | 25% | 中央値 | 75% | 最大 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
         )
+        for row in numeric_summary:
+            column = str(row.get("column", ""))
+            cells = [
+                _markdown_cell(column),
+                _format_count(row.get("count")),
+                _format_count(descriptive.get("missing", {}).get(column, 0)),
+                _format_stat(row.get("mean")),
+                _format_stat(row.get("std")),
+                _format_stat(row.get("min")),
+                _format_stat(row.get("25%")),
+                _format_stat(row.get("50%")),
+                _format_stat(row.get("75%")),
+                _format_stat(row.get("max")),
+            ]
+            lines.append(f"| {' | '.join(cells)} |")
+    else:
+        lines.append("_数値列はありません。_")
+    lines.extend(["", "### カテゴリ列", ""])
+    categorical_summary = descriptive.get("categorical_summary", [])
+    if categorical_summary:
+        lines.extend(
+            [
+                "| 列 | 有効件数 | 欠損数 | ユニーク数 | 最頻値 | 最頻値件数 |",
+                "|---|---:|---:|---:|---|---:|",
+            ]
+        )
+        for row in categorical_summary:
+            column = str(row.get("column", ""))
+            cells = [
+                _markdown_cell(column),
+                _format_count(row.get("count")),
+                _format_count(descriptive.get("missing", {}).get(column, 0)),
+                _format_count(row.get("unique")),
+                _markdown_cell(row.get("top")),
+                _format_count(row.get("freq")),
+            ]
+            lines.append(f"| {' | '.join(cells)} |")
+    else:
+        lines.append("_カテゴリ列はありません。_")
     narrative = report.get("narrative", {})
     if narrative:
         lines.extend(["", "## AIによる定性的な要約", ""])

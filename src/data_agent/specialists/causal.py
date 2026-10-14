@@ -26,7 +26,12 @@ def _coerce_treatment(series: pd.Series, treatment_value: Any) -> pd.Series:
 
 def run_causal_analysis(frame: pd.DataFrame, answers: dict[str, dict[str, Any]]) -> dict[str, Any]:
     scope = _value(answers, "analysis_scope")
-    if scope not in CAUSAL_SCOPES:
+    includes_causal = (
+        any(item in CAUSAL_SCOPES for item in scope)
+        if isinstance(scope, list)
+        else scope in CAUSAL_SCOPES
+    )
+    if not includes_causal:
         return {"status": "not_requested", "reason": "選択した分析範囲に因果推論を含まない"}
     target = str(_value(answers, "target_column") or "")
     treatment = str(_value(answers, "treatment_column") or "")

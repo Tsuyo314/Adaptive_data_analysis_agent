@@ -29,6 +29,7 @@ dependencies = [
   "openai>=2,<3",
   "PyJWT[crypto]>=2.9,<3",
   "platformdirs>=4,<5",
+  "keyring>=25,<26",
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,19 @@
 # Adaptive Data Analysis Agent
 
-CSV/XLSXと関連資料をカレントディレクトリから安全に探索し、質問、計画承認、前処理、EDA、因果推論、検証、レポートまでを再開可能なLangGraphワークフローで実行します。AIはChatGPT Plus/Pro、OpenRouter、AIなし（決定論モード）からRunごとに選択できます。計算・因果推定・検証は常にローカルの決定論的Pythonで実行します。
+**まだ開発途中です．**
+
+## 概要
+
+LangGraph で分析手順と状態を管理する、対話型のデータ分析ツール。関連資料（データ）を読み取り、ユーザーへの確認、分析計画、前処理、EDA、因果分析、検証、レポート作成を一つのワークフローとして実行する。
+
+基本的な機能:
+
+- 分析データと関連資料の自動探索、および分析可能性の確認
+- 不足情報の質問と、ユーザー承認を含む分析計画の作成
+- 前処理、データ検証、基礎統計、EDA、グラフ生成
+- 条件を確認した上での因果分析と専門的な検証
+- Checkpointからの再開、局所Retry、実行履歴とレポートの保存
+- CLIとStreamlitの両方に対応し、ChatGPT Plus/Pro、OpenRouter、AIなしから選択可能
 
 ## 処理フロー
 
@@ -60,9 +73,42 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 ```
 
+### Agent本体と分析workspace
+
+このリポジトリはAgent本体として使用し、実データはリポジトリ直下の `data-analysis/` に
+案件ごとに分けて配置します。プロジェクト名だけを指定すると必要なフォルダを作成できます。
+
+```bash
+data-agent init sales-project
+```
+
+```text
+Adaptive_Data_Analysis_Agent/
+├── src/、app/、conf/ ...        # Agent本体
+└── data-analysis/
+    ├── sales-project/
+    │   ├── data/                # CSV・XLSX
+    │   ├── references/          # README・仕様書などの関連資料
+    │   └── .data-agent/runs/    # Run成果物・状態・ログ
+    └── another-project/
+        ├── data/
+        ├── references/
+        └── .data-agent/runs/
+```
+
+対象ファイルを作成したプロジェクトの `data/` と `references/` に置いたら、そのまま起動します。
+
+```bash
+data-agent run
+```
+
+プロジェクトが1件なら自動選択し、複数なら番号で選択します。`data-analysis/<project>/` 内で
+実行した場合はそのプロジェクトを自動選択します。元データは変更せず、生成物は各プロジェクトの
+`.data-agent/` の中だけに保存します。別の場所を使いたい場合だけ `--workspace` を指定します。
+
 ### AIの選択
 
-対象となるChatGPT Plus/Proアカウントを使う場合、OpenAI APIキーは不要です。`data-agent run` の選択画面で「ChatGPT Plus/Pro」を選び、`Continue with ChatGPT` からブラウザ認証します。利用できるモデルは、サインインしたアカウントのライブ一覧から選びます。OAuthのアクセストークン、リフレッシュトークン、IDトークンはプロセス終了までメモリにだけ保持するため、`resume` を別プロセスで実行した場合は再度サインインします。
+対象となるChatGPT Plus/Proアカウントを使う場合、OpenAI APIキーは不要です。`data-agent run` の選択画面で「ChatGPT Plus/Pro」を選び、`Continue with ChatGPT` からブラウザ認証します。利用できるモデルは、サインインしたアカウントのライブ一覧から選びます。OAuth認証情報はOSの資格情報ストア（macOSではKeychain）へ保存され、既定では認証から1日間再利用します。
 
 ChatGPTプランの利用状況とアプリごとの上限は、CLI/UIに表示される `Manage usage` からChatGPT設定で確認できます。
 
@@ -83,21 +129,21 @@ data-agent run --provider deterministic
 
 ChatGPT認証のコールバックは `127.0.0.1` の一時ポートを使うため、CLIとStreamlitはローカル実行を対象とします。リモート配置したStreamlitへのOAuthコールバックはこの版の対象外です。
 
-サンプルデータでCLIを実行します。
+同梱サンプルでCLIを実行します。
 
 ```bash
-cd examples
-data-agent run
-# prompt> sales.csv の売上傾向を把握したい
+data-agent run --workspace examples
+# prompt> data/sales.csv の売上傾向を把握したい
 ```
 
 分析依頼をコマンド引数で直接渡すこともできます。
 
 ```bash
-data-agent run "sales.csv の売上傾向を把握したい"
+data-agent run "data/sales.csv の売上傾向を把握したい" --workspace examples
 ```
 
-質問は、二択なら `y/n`、3択以上なら番号で回答します。選択式で `0` を入力すると補足文を保存した後、元の質問へ戻ります。計画と中間結果を承認しない限り後続分析は実行されません。
+質問は、二択なら `y/n`、3択以上なら番号で回答します。分析範囲は `1,3` のように
+カンマ区切りで複数選択できます。選択式で `0` を入力すると補足文を保存した後、元の質問へ戻ります。計画と中間結果を承認しない限り後続分析は実行されません。
 
 Streamlit UI:
 
@@ -105,13 +151,17 @@ Streamlit UI:
 streamlit run app/streamlit_app.py
 ```
 
-UIをプロジェクトルートから起動すると、プロジェクト配下のCSV/XLSXを探索します。任意の分析用ディレクトリを使う場合は、そのディレクトリでCLIを実行してください。
+画面左側で `data-analysis/` 配下のプロジェクトを選択します。分析用ルートを別の場所へ置く場合は
+環境変数 `DATA_AGENT_ANALYSIS_ROOT` で変更できます。Agent本体のフォルダ全体を探索することはありません。
 
 ## CLI
 
 ```bash
-data-agent run                 # 起動後にプロンプトから分析依頼を入力
+data-agent init <プロジェクト名> # data-analysis配下に分析プロジェクトを作成
+data-agent run                 # プロジェクト選択後、分析依頼を入力
 data-agent run "分析依頼"      # 分析依頼を引数で指定
+data-agent run -p <プロジェクト名>
+data-agent run --workspace <分析workspace>
 data-agent run --provider chatgpt
 data-agent run --provider openrouter --model <ライブ一覧のモデルID>
 data-agent run --provider deterministic
@@ -122,14 +172,22 @@ data-agent graph --format mermaid
 data-agent graph --format ascii
 ```
 
-中断時に表示された `run_id` を `resume` に渡すと、同じ `thread_id` と最新の `runs/<run_id>/state/latest.json` から再開します。
+ChatGPTのOAuth認証情報はOSの資格情報ストア（macOSではKeychain）へ保存されます。
+既定ではブラウザ認証から1日間だけ再利用し、アクセストークンは必要に応じて自動更新します。
+1日経過後は保存済みセッションを失効・削除し、ブラウザで再サインインします。期間は
+`conf/config.yaml` の `llm.chatgpt_reauth_days` で変更できます。
+
+中断時に表示された `run_id` を `resume` に渡すと、同じ `thread_id` と最新の
+`.data-agent/runs/<run_id>/state/latest.json` から再開します。整理前の `runs/` にあるRunも
+一覧表示・再開できますが、新しいRunは `.data-agent/runs/` に保存されます。
 
 ## MVPの動作
 
 - CSV/XLSXを軽量確認し、README/MD/TXT/JSON/YAML/PYをテキストとして参照します。Pythonコードは実行しません。
 - 元ファイルを変更せず、前処理済みデータと変換履歴をRun配下に保存します。
 - 欠損、型、重複、無限値、集計値をルールID付きで検証します。Panderaが利用可能ならスキーマ検証も実行します。
-- 記述統計とPlotly図表を生成します。
+- 数値列の四分位点とカテゴリ列の頻度を含む基礎統計表、およびPlotly図表を生成します。
+- CLIでは外部AIの応答待ちの間、処理内容と回転するスピナーを表示します。
 - 因果分析選択時は処置、対照、介入時点、交絡、識別仮定を確認します。条件が不足する場合は推定を強行せず理由を報告します。MVPの推定法は数値アウトカムに対するHC3ロバスト標準誤差付き回帰調整です。
 - Nodeの開始、終了、失敗、RetryをSQLiteとJSONLへ記録します。同一Nodeの失敗が設定上限を超えるとHuman Reviewで停止します。
 - StreamlitとMarkdownは同じ `report/report_data.json` と検証済み成果物を参照します。
@@ -138,7 +196,7 @@ data-agent graph --format ascii
 
 ## 成果物
 
-各Runは `runs/<run_id>/` に保存されます。主なファイルは次の通りです。
+各Runは分析workspaceの `.data-agent/runs/<run_id>/` に保存されます。主なファイルは次の通りです。
 
 ```text
 inputs/             探索結果、軽量プロファイル、関連資料要約
@@ -154,11 +212,11 @@ state/              逐次Checkpoint
 logs/process.jsonl  Nodeイベント
 ```
 
-`runs/runs.sqlite3` はRun、承認、実行イベントの索引です。元データはRunへコピーせず、パスとSHA-256だけを記録します。
+`.data-agent/runs/runs.sqlite3` はRun、承認、実行イベントの索引です。元データはRunへコピーせず、パスとSHA-256だけを記録します。
 
 ## 安全性と制約
 
-- cwd外のパスは暗黙には読みません。CLIから別workspaceを明示してください。
+- 分析workspace外のパスは暗黙には読みません。別の分析フォルダは `--workspace` で明示してください。
 - ファイルサイズと関連資料サイズには `conf/config.yaml` の上限があります。
 - 関連資料内の命令はデータとして扱い、実行しません。
 - 外部AIへ送るのは、パスを除去した依頼、列名・型・行数・欠損集計、回答値、検証済み集計結果だけです。生データ、サンプル行、README等の関連資料、ローカルパス、シークレットは送信しません。

@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -52,7 +53,15 @@ def test_service_repairs_schema_once_and_writes_redacted_audit(tmp_path: Path):
             {"question_ids": ["known"], "rationale": "fixed"},
         ]
     )
-    service = LLMService(provider, store(tmp_path), max_attempts=2)
+    activity_events = []
+
+    @contextmanager
+    def activity(task, attempt):
+        activity_events.append(("start", task, attempt))
+        yield
+        activity_events.append(("end", task, attempt))
+
+    service = LLMService(provider, store(tmp_path), max_attempts=2, activity=activity)
     result = service.generate(
         "question_planner",
         {
@@ -64,6 +73,12 @@ def test_service_repairs_schema_once_and_writes_redacted_audit(tmp_path: Path):
     )
     assert result.question_ids == ["known"]
     assert provider.calls == 2
+    assert activity_events == [
+        ("start", "question_planner", 1),
+        ("end", "question_planner", 1),
+        ("start", "question_planner", 2),
+        ("end", "question_planner", 2),
+    ]
     audit = json.loads(Path(service.last_audit_path).read_text())
     assert audit["input_categories"] == ["credentials", "request"]
     assert "must-not-be-stored" not in json.dumps(audit)

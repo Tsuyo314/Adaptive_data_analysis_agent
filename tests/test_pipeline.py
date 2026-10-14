@@ -22,8 +22,8 @@ def test_pipeline_pauses_for_approvals_and_report_matches(tmp_path: Path):
         {
             "analysis_scope": {
                 "question_id": "analysis_scope",
-                "choice": "1",
-                "value": "傾向把握・記述統計",
+                "choice": "1,2",
+                "value": ["傾向把握・記述統計", "データ品質確認"],
                 "notes": [],
             },
             "target_column": {
@@ -53,7 +53,16 @@ def test_pipeline_pauses_for_approvals_and_report_matches(tmp_path: Path):
     report = json.loads((pipeline.store.root / "report/report_data.json").read_text())
     descriptive = json.loads((pipeline.store.root / "analysis/descriptive.json").read_text())
     assert report["descriptive"]["row_count"] == descriptive["row_count"] == 4
-    assert "分析対象行数: 4" in (pipeline.store.root / "report/report.md").read_text()
+    report_markdown = (pipeline.store.root / "report/report.md").read_text()
+    assert "分析対象行数: 4" in report_markdown
+    assert "## 基礎統計量" in report_markdown
+    assert (
+        "| 列 | 有効件数 | 欠損数 | 平均 | 標準偏差 | 最小 | 25% | 中央値 | 75% | 最大 |"
+        in report_markdown
+    )
+    assert "| value | 4 | 0 | 2.5 |" in report_markdown
+    assert "### カテゴリ列" in report_markdown
+    assert "| group | 4 | 0 | 2 |" in report_markdown
     resumed = Pipeline.resume("test-run", workspace=tmp_path, settings=settings)
     assert resumed.state["thread_id"] == state["thread_id"]
 
