@@ -8,6 +8,16 @@ import yaml
 
 
 @dataclass(frozen=True)
+class LLMSettings:
+    default_provider: str = "deterministic"
+    timeout_seconds: float = 120.0
+    max_attempts: int = 2
+    consent_policy_version: str = "1"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openai_base_url: str = "https://api.openai.com/v1"
+
+
+@dataclass(frozen=True)
 class Settings:
     max_file_size_mb: int = 100
     metadata_sample_rows: int = 200
@@ -28,6 +38,7 @@ class Settings:
         ".yml",
         ".py",
     )
+    llm: LLMSettings = field(default_factory=LLMSettings)
     phase_weights: dict[str, int] = field(
         default_factory=lambda: {
             "discovery": 10,
@@ -50,4 +61,6 @@ class Settings:
         for key in ("allowed_data_extensions", "allowed_support_extensions"):
             if key in values:
                 values[key] = tuple(values[key])
+        if "llm" in values:
+            values["llm"] = LLMSettings(**values["llm"])
         return cls(**values)

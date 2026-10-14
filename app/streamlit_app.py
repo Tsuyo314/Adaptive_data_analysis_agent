@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -15,16 +16,110 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from data_agent.config import Settings  # noqa: E402
+from data_agent.llm import LLMService, ProviderError  # noqa: E402
+from data_agent.llm.chatgpt_auth import ChatGPTAuthClient  # noqa: E402
+from data_agent.llm.preferences import Preferences  # noqa: E402
+from data_agent.llm.providers import ChatGPTProvider, OpenRouterProvider  # noqa: E402
 from data_agent.pipeline import Pipeline  # noqa: E402
 from data_agent.schemas import Question, QuestionKind  # noqa: E402
 from data_agent.storage import RunStore  # noqa: E402
 
 st.set_page_config(page_title="Adaptive Data Analysis Agent", page_icon="📊", layout="wide")
 settings = Settings.load(PROJECT_ROOT / "conf/config.yaml")
+preferences = Preferences()
+PROVIDER_LABELS = {
+    "chatgpt": "ChatGPT Plus/Pro",
+    "openrouter": "OpenRouter API",
+    "deterministic": "AIなし",
+}
 
 
 def load_pipeline(run_id: str) -> Pipeline:
-    return Pipeline.resume(run_id, workspace=PROJECT_ROOT, settings=settings)
+    pipeline = Pipeline.resume(run_id, workspace=PROJECT_ROOT, settings=settings)
+    provider = st.session_state.get("llm_provider_object")
+    if provider and provider.name == pipeline.state.get("llm_provider"):
+        provider.model = pipeline.state.get("llm_model", "")
+        pipeline.llm_service = LLMService(provider, pipeline.store, settings.llm.max_attempts)
+    return pipeline
+
+
+def provider_controls(prefix: str, initial: str | None = None) -> tuple[str, Any, str, bool]:
+    previous, previous_models = preferences.last_selection()
+    default_provider = initial or previous or "deterministic"
+    if default_provider not in PROVIDER_LABELS:
+        default_provider = "deterministic"
+    provider_name = st.selectbox(
+        "使用するAI",
+        list(PROVIDER_LABELS),
+        index=list(PROVIDER_LABELS).index(default_provider),
+        format_func=PROVIDER_LABELS.get,
+        key=f"{prefix}-provider",
+    )
+    if provider_name == "deterministic":
+        return provider_name, None, "", True
+    consented = preferences.has_consent(provider_name, settings.llm.consent_policy_version)
+    consent = consented or st.checkbox(
+        "メタデータと検証済み集計だけを外部AIへ送信することに同意",
+        key=f"{prefix}-consent",
+        help="生データ、サンプル行、関連資料、ローカルパス、認証情報は送信しません。",
+    )
+    if provider_name == "openrouter":
+        key_ready = bool(os.getenv("OPENROUTER_API_KEY"))
+        st.caption("OPENROUTER_API_KEY: 設定済み" if key_ready else "OPENROUTER_API_KEY: 未設定")
+        button_label = "OpenRouterに接続"
+    else:
+        key_ready = True
+        button_label = "Continue with ChatGPT"
+    connection_key = f"{prefix}-connected-provider"
+    connected = st.session_state.get(connection_key)
+    if st.button(button_label, key=f"{prefix}-connect", disabled=not consent or not key_ready):
+        if not consented:
+            preferences.grant_consent(provider_name, settings.llm.consent_policy_version)
+        try:
+            if provider_name == "chatgpt":
+                auth = ChatGPTAuthClient(
+                    preferences=preferences, timeout=settings.llm.timeout_seconds
+                )
+                tokens = auth.authenticate()
+                provider = ChatGPTProvider(
+                    auth,
+                    base_url=settings.llm.openai_base_url,
+                    timeout=settings.llm.timeout_seconds,
+                )
+                st.session_state[f"{prefix}-account"] = tokens.email or tokens.subject
+            else:
+                provider = OpenRouterProvider(
+                    base_url=settings.llm.openrouter_base_url,
+                    timeout=settings.llm.timeout_seconds,
+                )
+            models = provider.list_models()
+            if not models:
+                raise ProviderError("利用可能な構造化出力対応モデルがありません")
+            st.session_state[connection_key] = provider
+            st.session_state[f"{prefix}-models"] = models
+            connected = provider
+        except ProviderError as exc:
+            st.error(str(exc))
+    if not connected or connected.name != provider_name:
+        return provider_name, None, "", False
+    if provider_name == "chatgpt":
+        st.success(f"Using ChatGPT plan: {st.session_state.get(f'{prefix}-account', '接続済み')}")
+        st.link_button("Manage usage", "https://chatgpt.com/settings/usage")
+    models = st.session_state.get(f"{prefix}-models", [])
+    ids = [item.id for item in models]
+    preferred = previous_models.get(provider_name)
+    model_index = ids.index(preferred) if preferred in ids else 0
+    selected_model = st.selectbox(
+        "モデル",
+        ids,
+        index=model_index,
+        format_func=lambda identifier: next(
+            item.display_name for item in models if item.id == identifier
+        ),
+        key=f"{prefix}-model",
+    )
+    connected.model = selected_model
+    return provider_name, connected, selected_model, True
 
 
 def events(store: RunStore) -> list[dict[str, Any]]:
@@ -157,7 +252,14 @@ def render_report(pipeline: Pipeline) -> None:
         st.dataframe(pd.DataFrame(report["validations"]), use_container_width=True)
     with tabs[5]:
         st.dataframe(pd.DataFrame(events(pipeline.store)), use_container_width=True)
-        st.json({"plan_version": report["plan_version"], "provenance": report["provenance"]})
+        st.json(
+            {
+                "plan_version": report["plan_version"],
+                "provenance": report["provenance"],
+                "llm": report.get("llm", {}),
+                "llm_calls": pipeline.state.get("llm_calls", []),
+            }
+        )
 
 
 st.title("Adaptive Data Analysis Agent")
@@ -174,13 +276,22 @@ with st.sidebar:
     if selected == "新規":
         request = st.text_area("分析依頼", "売上データの傾向を把握したい")
         allow_outside = st.checkbox("依頼文に記載したcwd外のパス参照を明示的に許可")
-        if st.button("cwdを探索して開始", type="primary"):
+        provider_name, connected, selected_model, ready = provider_controls("new")
+        if st.button("cwdを探索して開始", type="primary", disabled=not ready):
             pipeline = Pipeline.create(
                 request,
                 workspace=PROJECT_ROOT,
                 settings=settings,
                 allow_outside_workspace=allow_outside,
+                llm_provider=provider_name,
+                llm_model=selected_model,
             )
+            if connected:
+                pipeline.llm_service = LLMService(
+                    connected, pipeline.store, settings.llm.max_attempts
+                )
+                st.session_state["llm_provider_object"] = connected
+            preferences.remember_selection(provider_name, selected_model)
             pipeline.run_until_pause()
             st.session_state["run_id"] = pipeline.state["run_id"]
             st.rerun()
@@ -201,6 +312,27 @@ if run_id:
     st.progress(progress / 100, text="フェーズ重みから算出した推定進捗")
     active_label = ", ".join(active_nodes) or "停止中"
     st.caption(f"Node: {active_label} / thread_id: {state['thread_id']}")
+    st.caption(
+        f"AI: {PROVIDER_LABELS.get(state.get('llm_provider', 'deterministic'))}"
+        f" / {state.get('llm_model') or 'モデルなし'}"
+    )
+
+    if (
+        state.get("llm_provider") != "deterministic"
+        and pipeline.llm_service is None
+        and state["status"] != "complete"
+        and state["status"] != "awaiting_llm_provider"
+    ):
+        st.warning("このプロセスにはAI資格情報がありません。続行前に再接続してください。")
+        provider_name, connected, selected_model, ready = provider_controls(
+            "resume", state.get("llm_provider")
+        )
+        if ready and connected and st.button("このRunへ接続を適用", type="primary"):
+            service = LLMService(connected, pipeline.store, settings.llm.max_attempts)
+            pipeline.select_llm_provider(provider_name, selected_model, service)
+            st.session_state["llm_provider_object"] = connected
+            preferences.remember_selection(provider_name, selected_model)
+            st.rerun()
 
     if state["status"] == "awaiting_questions":
         st.subheader("質問")
@@ -240,6 +372,29 @@ if run_id:
     elif state["status"] == "human_review":
         st.error("再試行上限に達しました。Human Reviewが必要です。")
         st.json(state.get("error", {}))
+    elif state["status"] == "awaiting_llm_provider":
+        st.warning("AIプロバイダーまたはモデルの再選択が必要です。")
+        st.json(
+            {
+                "pending": state.get("pending_llm_operation"),
+                "reason": state.get("llm_reselection_reason"),
+            }
+        )
+        provider_name, connected, selected_model, ready = provider_controls(
+            "reselect", state.get("llm_provider")
+        )
+        if ready and st.button("再選択して保留中の処理を再実行", type="primary"):
+            service = (
+                LLMService(connected, pipeline.store, settings.llm.max_attempts)
+                if connected
+                else None
+            )
+            pipeline.select_llm_provider(provider_name, selected_model, service)
+            if connected:
+                st.session_state["llm_provider_object"] = connected
+            preferences.remember_selection(provider_name, selected_model)
+            pipeline.run_until_pause()
+            st.rerun()
     elif state["status"] == "complete":
         render_report(pipeline)
 else:

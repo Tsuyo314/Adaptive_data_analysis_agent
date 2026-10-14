@@ -11,6 +11,10 @@ from rich.table import Table
 
 from data_agent.config import Settings
 from data_agent.graph import build_graph
+from data_agent.llm import LLMService, ModelInfo, ProviderError
+from data_agent.llm.chatgpt_auth import ChatGPTAuthClient
+from data_agent.llm.preferences import Preferences
+from data_agent.llm.providers import ChatGPTProvider, OpenRouterProvider
 from data_agent.pipeline import Pipeline
 from data_agent.schemas import Question
 from data_agent.storage import RunStore
@@ -19,6 +23,101 @@ from data_agent.tools.questions import ask_interactively
 
 app = typer.Typer(help="Adaptive Data Analysis Agent")
 console = Console()
+PROVIDER_LABELS = {
+    "chatgpt": "ChatGPT Plus/Pro（Continue with ChatGPT）",
+    "openrouter": "OpenRouter API",
+    "deterministic": "AIなし（決定論モード）",
+}
+
+
+def _choose_numbered(label: str, values: list[tuple[str, str]], default_id: str | None) -> str:
+    console.print(f"\n[bold]{label}[/bold]")
+    for index, (_, display) in enumerate(values, 1):
+        suffix = " [dim](前回)[/dim]" if values[index - 1][0] == default_id else ""
+        console.print(f"  {index}. {display}{suffix}")
+    default_index = next(
+        (index for index, (identifier, _) in enumerate(values, 1) if identifier == default_id), 1
+    )
+    while True:
+        raw = console.input(f"> [{default_index}] ").strip() or str(default_index)
+        if raw.isdigit() and 1 <= int(raw) <= len(values):
+            return values[int(raw) - 1][0]
+        console.print(f"[red]1〜{len(values)}の番号を入力してください。[/red]")
+
+
+def _select_provider(requested: str | None, preferences: Preferences) -> str:
+    if requested:
+        if requested not in PROVIDER_LABELS:
+            raise typer.BadParameter("providerはchatgpt、openrouter、deterministicのいずれかです")
+        return requested
+    previous, _ = preferences.last_selection()
+    choices = [(key, label) for key, label in PROVIDER_LABELS.items()]
+    return _choose_numbered("使用するAI", choices, previous)
+
+
+def _ensure_consent(provider: str, settings: Settings, preferences: Preferences) -> None:
+    if provider == "deterministic" or preferences.has_consent(
+        provider, settings.llm.consent_policy_version
+    ):
+        return
+    console.print(
+        Panel(
+            "外部AIへ送信するのは、分析依頼（ファイルパスは除去）、列名・型・行数・欠損集計、"
+            "回答、検証済み集計結果です。生データ、サンプル行、関連資料、ローカルパス、"
+            "認証情報は送信しません。",
+            title=f"{PROVIDER_LABELS[provider]}へのデータ送信同意",
+        )
+    )
+    if not typer.confirm("このポリシーに同意しますか？", default=False):
+        raise typer.Abort()
+    preferences.grant_consent(provider, settings.llm.consent_policy_version)
+
+
+def _select_model(
+    models: list[ModelInfo], requested: str | None, provider: str, preferences: Preferences
+) -> str:
+    if not models:
+        raise ProviderError("利用可能な構造化出力対応モデルがありません")
+    model_ids = {item.id for item in models}
+    if requested:
+        if requested not in model_ids:
+            raise ProviderError(f"選択したモデルは現在のアカウントで利用できません: {requested}")
+        return requested
+    _, previous_models = preferences.last_selection()
+    values = [(item.id, f"{item.display_name} ({item.id})") for item in models]
+    return _choose_numbered("モデル", values, previous_models.get(provider))
+
+
+def _connect_provider(
+    provider_name: str,
+    requested_model: str | None,
+    settings: Settings,
+    preferences: Preferences,
+):
+    _ensure_consent(provider_name, settings, preferences)
+    if provider_name == "deterministic":
+        preferences.remember_selection(provider_name)
+        return None, ""
+    if provider_name == "chatgpt":
+        console.print("[bold]Continue with ChatGPT[/bold] — ブラウザでサインインしてください。")
+        auth = ChatGPTAuthClient(preferences=preferences, timeout=settings.llm.timeout_seconds)
+        tokens = auth.authenticate()
+        provider = ChatGPTProvider(
+            auth,
+            base_url=settings.llm.openai_base_url,
+            timeout=settings.llm.timeout_seconds,
+        )
+        console.print(f"[green]Using ChatGPT plan[/green] {tokens.email or tokens.subject}")
+        console.print("Manage usage: https://chatgpt.com/settings/usage")
+    else:
+        provider = OpenRouterProvider(
+            base_url=settings.llm.openrouter_base_url,
+            timeout=settings.llm.timeout_seconds,
+        )
+    model = _select_model(provider.list_models(), requested_model, provider_name, preferences)
+    provider.model = model
+    preferences.remember_selection(provider_name, model)
+    return provider, model
 
 
 def _show_discovery(state: dict[str, Any]) -> None:
@@ -111,6 +210,30 @@ def _drive(pipeline: Pipeline) -> None:
                 )
             )
             raise typer.Exit(code=2)
+        elif status == "awaiting_llm_provider":
+            console.print(
+                Panel(
+                    f"Task: {state.get('pending_llm_operation', {}).get('task')}\n"
+                    f"理由: {state.get('llm_reselection_reason', 'AI接続エラー')}",
+                    title="AIプロバイダーの再選択が必要です",
+                    border_style="yellow",
+                )
+            )
+            preferences = Preferences()
+            provider_name = _select_provider(None, preferences)
+            try:
+                provider, model = _connect_provider(
+                    provider_name, None, pipeline.settings, preferences
+                )
+            except ProviderError as exc:
+                console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=2) from exc
+            service = (
+                LLMService(provider, pipeline.store, pipeline.settings.llm.max_attempts)
+                if provider
+                else None
+            )
+            pipeline.select_llm_provider(provider_name, model, service)
         else:
             console.print(f"停止状態: {status}")
             return
@@ -121,6 +244,10 @@ def _drive(pipeline: Pipeline) -> None:
 def run(
     request: str | None = typer.Argument(None, help="分析依頼。省略時は起動後に入力"),
     workspace: Path = typer.Option(Path.cwd(), exists=True, file_okay=False, resolve_path=True),
+    provider: str | None = typer.Option(
+        None, "--provider", help="chatgpt、openrouter、deterministic。省略時は対話選択"
+    ),
+    model: str | None = typer.Option(None, "--model", help="ライブ一覧にあるモデルID"),
 ) -> None:
     """新しい分析Runを開始します。"""
     if request is None:
@@ -146,7 +273,28 @@ def run(
             )
             if not allow_outside:
                 raise typer.Abort() from None
-    pipeline = Pipeline.create(request, workspace=workspace, allow_outside_workspace=allow_outside)
+    settings = Settings.load(workspace / "conf/config.yaml")
+    preferences = Preferences()
+    provider_name = _select_provider(provider, preferences)
+    try:
+        connected_provider, selected_model = _connect_provider(
+            provider_name, model, settings, preferences
+        )
+    except ProviderError as exc:
+        console.print(f"[red]AI接続エラー: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    pipeline = Pipeline.create(
+        request,
+        workspace=workspace,
+        settings=settings,
+        allow_outside_workspace=allow_outside,
+        llm_provider=provider_name,
+        llm_model=selected_model,
+    )
+    if connected_provider:
+        pipeline.llm_service = LLMService(
+            connected_provider, pipeline.store, settings.llm.max_attempts
+        )
     console.print(f"Run ID: [bold]{pipeline.state['run_id']}[/bold]")
     _drive(pipeline)
 
@@ -157,7 +305,33 @@ def resume(
     workspace: Path = typer.Option(Path.cwd(), exists=True, file_okay=False, resolve_path=True),
 ) -> None:
     """同一thread_idのチェックポイントから再開します。"""
-    _drive(Pipeline.resume(run_id, workspace=workspace))
+    pipeline = Pipeline.resume(run_id, workspace=workspace)
+    provider_name = pipeline.state.get("llm_provider", "deterministic")
+    model = pipeline.state.get("llm_model") or None
+    if provider_name != "deterministic":
+        try:
+            connected, selected_model = _connect_provider(
+                provider_name, model, pipeline.settings, Preferences()
+            )
+        except ProviderError as exc:
+            console.print(f"[yellow]AI再接続エラー: {exc}[/yellow]")
+            console.print("別のプロバイダーまたはAIなしを選択してください。")
+            preferences = Preferences()
+            provider_name = _select_provider(None, preferences)
+            try:
+                connected, selected_model = _connect_provider(
+                    provider_name, None, pipeline.settings, preferences
+                )
+            except ProviderError as retry_exc:
+                console.print(f"[red]AI再接続エラー: {retry_exc}[/red]")
+                raise typer.Exit(code=2) from retry_exc
+        pipeline.llm_service = (
+            LLMService(connected, pipeline.store, pipeline.settings.llm.max_attempts)
+            if connected
+            else None
+        )
+        pipeline.select_llm_provider(provider_name, selected_model, pipeline.llm_service)
+    _drive(pipeline)
 
 
 @app.command("list-runs")

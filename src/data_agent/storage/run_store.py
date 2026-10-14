@@ -33,6 +33,10 @@ def _library_versions() -> dict[str, str]:
         "plotly",
         "streamlit",
         "pydantic",
+        "httpx",
+        "openai",
+        "PyJWT",
+        "platformdirs",
     )
     versions: dict[str, str] = {}
     for package in packages:
@@ -56,6 +60,7 @@ class RunStore:
         "validation",
         "visualizations",
         "report",
+        "llm",
         "logs",
     )
 
@@ -239,6 +244,13 @@ class RunStore:
 
     def artifact(self, relative_path: str) -> str:
         return str((self.root / relative_path).resolve())
+
+    def write_llm_call(self, task: str, value: dict[str, Any]) -> Path:
+        existing = sorted((self.root / "llm").glob("call_*.json"))
+        safe_task = "".join(
+            character for character in task if character.isalnum() or character in "-_"
+        )
+        return self.write_json(f"llm/call_{len(existing) + 1:03d}_{safe_task}.json", value)
 
     @classmethod
     def list_runs(cls, runs_root: Path) -> list[dict[str, Any]]:

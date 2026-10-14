@@ -102,6 +102,16 @@ def render_markdown(report: dict[str, Any]) -> str:
                 max=row.get("max", float("nan")) or 0,
             )
         )
+    narrative = report.get("narrative", {})
+    if narrative:
+        lines.extend(["", "## AIによる定性的な要約", ""])
+        for item in narrative.get("summary", []):
+            evidence = ", ".join(item["evidence_ids"])
+            lines.append(f"- {item['text']}（根拠: `{evidence}`）")
+        lines.extend(["", "### 解釈", ""])
+        for item in narrative.get("interpretations", []):
+            evidence = ", ".join(item["evidence_ids"])
+            lines.append(f"- {item['text']}（根拠: `{evidence}`）")
     lines.extend(["", "## 因果分析", ""])
     if causal.get("status") == "estimated":
         low, high = causal["confidence_interval"]
@@ -123,6 +133,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"| {result['rule_id']} | {verdict} | {result['reason']} |")
     lines.extend(["", "## 制約", ""])
     lines.extend(f"- {item}" for item in report["limitations"])
+    for item in narrative.get("limitations", []):
+        evidence = ", ".join(item["evidence_ids"])
+        lines.append(f"- {item['text']}（根拠: `{evidence}`）")
     lines.extend(
         [
             "",
@@ -131,6 +144,18 @@ def render_markdown(report: dict[str, Any]) -> str:
             "- 欠損・外れ値・期間定義を業務知識と照合してください。",
             "- 因果推論を意思決定に用いる場合は識別仮定と感度分析を追加レビューしてください。",
             "- `logs/process.jsonl` と検証JSONから処理履歴を監査できます。",
+        ]
+    )
+    for item in narrative.get("next_actions", []):
+        evidence = ", ".join(item["evidence_ids"])
+        lines.append(f"- {item['text']}（根拠: `{evidence}`）")
+    lines.extend(
+        [
+            "",
+            "## AI設定",
+            "",
+            f"- Provider: `{report.get('llm', {}).get('provider', 'deterministic')}`",
+            f"- Model: `{report.get('llm', {}).get('model', '') or 'なし'}`",
             "",
         ]
     )

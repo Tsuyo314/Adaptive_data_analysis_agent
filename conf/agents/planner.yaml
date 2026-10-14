@@ -1,3 +1,7 @@
-provider: deterministic
-external_llm_allowed: false
-
+provider: selected_at_runtime
+supported_providers:
+  - chatgpt
+  - openrouter
+  - deterministic
+structured_output: true
+allowed_payload: metadata_and_validated_aggregates_only

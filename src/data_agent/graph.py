@@ -29,6 +29,7 @@ WAITING_STATUSES = {
     "awaiting_plan_approval",
     "awaiting_intermediate_approval",
     "human_review",
+    "awaiting_llm_provider",
     "complete",
 }
 

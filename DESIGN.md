@@ -2,7 +2,7 @@
 
 ## 方針
 
-分析の再現性と説明可能性を優先し、データ処理・検証・レポート数値は決定論的なPythonで生成する。LangGraphは状態に基づくNode遷移を担い、人間の回答・承認を待つ状態では終了する。各Node完了時のStateはJSONへ、実行イベントと承認はSQLiteへ保存する。
+分析の再現性と説明可能性を優先し、データ処理・検証・レポート数値は決定論的なPythonで生成する。外部AIはQuestion Planner、Analysis Planner、Reflector、Reporterの構造化された判断だけを担当する。LangGraphは状態に基づくNode遷移を担い、人間の回答・承認を待つ状態では終了する。各Node完了時のStateはJSONへ、実行イベントと承認はSQLiteへ保存する。
 
 ## 状態遷移
 
@@ -23,12 +23,16 @@ flowchart TB
   causal_specialist --> specialist_validation
   specialist_validation --> report
   report --> complete
+  discovery -->|AI失敗| awaiting_llm_provider
+  plan -->|AI失敗| awaiting_llm_provider
+  report -->|AI失敗| awaiting_llm_provider
+  awaiting_llm_provider -->|手動再選択| pending_node[保留Nodeを再実行]
   data_validation -->|上限超過| human_review
   result_validation -->|上限超過| human_review
   specialist_validation -->|上限超過| human_review
 ```
 
-`initialized` などの自動進行状態だけがGraph内の次Nodeへ進む。`awaiting_*`、`human_review`、`complete` はGraphを停止させ、CLI/UIがユーザー入力をStateへ反映して再度invokeする。
+`initialized` などの自動進行状態だけがGraph内の次Nodeへ進む。`awaiting_*`、`human_review`、`complete` はGraphを停止させ、CLI/UIがユーザー入力をStateへ反映して再度invokeする。AI失敗時は `pending_llm_operation` にタスクと再開状態だけを保存し、資格情報を保存しない。
 
 ## 信頼境界
 
@@ -37,6 +41,9 @@ flowchart TB
 3. PYやREADMEはUTF-8テキストとして読み、内容を命令として実行しない。
 4. 原本を変更せず、前処理結果を新規Parquet（利用不可時はCSV）として保存する。
 5. 表示層は `report_data.json` とそのprovenanceが指す検証済み成果物だけを参照する。
+6. 外部AIへはパスを除去した依頼、列メタデータ、回答値、検証済み集計だけを送る。サンプル行、関連資料本文、パス、シークレットは送らない。
+7. ChatGPTのOAuthトークンはプロセス内だけに保持する。OpenRouterキーは環境変数だけから読む。Stateと `llm/` 監査成果物には秘密情報を保存しない。
+8. LLM出力はPydanticと許可IDで検証し、修復は一度だけ行う。失敗時は自動フォールバックせず `awaiting_llm_provider` で停止する。
 
 ## 因果分析
 
@@ -53,4 +60,3 @@ flowchart TB
 ## Retry
 
 Node例外を `file_or_access`、`data_or_analysis`、`execution` に分類し、同じNodeだけ再実行する。回数はStateに保持し、`max_retries` 超過で `human_review` に停止する。承認済み原本や不要な上流Nodeは再実行しない。
-

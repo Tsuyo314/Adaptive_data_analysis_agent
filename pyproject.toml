@@ -25,6 +25,10 @@ dependencies = [
   "rich>=13,<15",
   "grandalf>=0.8,<1",
   "typing-extensions>=4.12,<5",
+  "httpx>=0.27,<1",
+  "openai>=2,<3",
+  "PyJWT[crypto]>=2.9,<3",
+  "platformdirs>=4,<5",
 ]
 
 [project.optional-dependencies]

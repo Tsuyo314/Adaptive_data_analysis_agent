@@ -11,6 +11,8 @@ from typing import Any
 
 from data_agent.config import Settings
 from data_agent.graph import build_graph
+from data_agent.llm import LLMService, ProviderReselectionRequired
+from data_agent.llm.schemas import PlanProposal, QuestionSelection, Reflection, ReportNarrative
 from data_agent.schemas import PlanStep
 from data_agent.specialists.causal import run_causal_analysis
 from data_agent.state import AnalysisState
@@ -33,10 +35,17 @@ from data_agent.validators.core import (
 
 
 class Pipeline:
-    def __init__(self, state: AnalysisState, settings: Settings, store: RunStore):
+    def __init__(
+        self,
+        state: AnalysisState,
+        settings: Settings,
+        store: RunStore,
+        llm_service: LLMService | None = None,
+    ):
         self.state = state
         self.settings = settings
         self.store = store
+        self.llm_service = llm_service
         self.graph = build_graph(
             {
                 "discover": self._node("discover", self._discover),
@@ -59,6 +68,9 @@ class Pipeline:
         settings: Settings | None = None,
         run_id: str | None = None,
         allow_outside_workspace: bool = False,
+        llm_provider: str = "deterministic",
+        llm_model: str = "",
+        llm_service: LLMService | None = None,
     ) -> Pipeline:
         workspace = (workspace or Path.cwd()).resolve()
         settings = settings or Settings.load(workspace / "conf/config.yaml")
@@ -78,10 +90,14 @@ class Pipeline:
             "active_nodes": [],
             "outside_workspace_approved": allow_outside_workspace,
             "question_rounds": 0,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "llm_status": "disabled" if llm_provider == "deterministic" else "ready",
+            "llm_calls": [],
         }
         store = RunStore(workspace / settings.runs_dir, run_id)
         store.initialize(state, config=asdict(settings))
-        return cls(state, settings, store)
+        return cls(state, settings, store, llm_service)
 
     @classmethod
     def resume(
@@ -89,11 +105,29 @@ class Pipeline:
         run_id: str,
         workspace: Path | None = None,
         settings: Settings | None = None,
+        llm_service: LLMService | None = None,
     ) -> Pipeline:
         workspace = (workspace or Path.cwd()).resolve()
         settings = settings or Settings.load(workspace / "conf/config.yaml")
         store = RunStore(workspace / settings.runs_dir, run_id)
-        return cls(store.load_state(), settings, store)
+        return cls(store.load_state(), settings, store, llm_service)
+
+    def select_llm_provider(
+        self, provider: str, model: str = "", service: LLMService | None = None
+    ) -> AnalysisState:
+        if provider not in {"deterministic", "chatgpt", "openrouter"}:
+            raise ValueError(f"未対応のAIプロバイダーです: {provider}")
+        self.llm_service = service
+        self.state["llm_provider"] = provider
+        self.state["llm_model"] = model
+        self.state["llm_status"] = "disabled" if provider == "deterministic" else "ready"
+        pending = self.state.pop("pending_llm_operation", None)
+        self.state.pop("llm_reselection_reason", None)
+        self.state.pop("error", None)
+        if self.state.get("status") == "awaiting_llm_provider" and pending:
+            self.state["status"] = str(pending["resume_status"])
+        self.store.checkpoint(self.state)
+        return self.state
 
     def run_until_pause(self) -> AnalysisState:
         self.state = self.graph.invoke(
@@ -116,7 +150,13 @@ class Pipeline:
             }
             self.store.checkpoint(self.state)
             return self.state
-        pending = select_questions(merged, self.settings.max_questions_per_round)
+        try:
+            pending = self._select_questions(self.state, merged)
+        except ProviderReselectionRequired as exc:
+            if self.llm_service:
+                self._record_llm_call(self.llm_service, self.state)
+            self._pause_for_llm(self.state, exc, "discover", "initialized")
+            return self.state
         if pending:
             if self.state["question_rounds"] >= self.settings.max_question_rounds:
                 self.state["status"] = "human_review"
@@ -187,6 +227,29 @@ class Pipeline:
                 self.store.checkpoint(state)
                 self.state = state
                 return state
+            except ProviderReselectionRequired as exc:
+                duration = (time.perf_counter() - started) * 1000
+                if self.llm_service:
+                    self._record_llm_call(self.llm_service, state)
+                state["status"] = "awaiting_llm_provider"
+                state["llm_status"] = "reselection_required"
+                state["llm_reselection_reason"] = exc.reason
+                state["pending_llm_operation"] = {
+                    "task": exc.task,
+                    "node": name,
+                    "resume_status": self._resume_status_for_node(name),
+                }
+                state["active_nodes"] = []
+                self.store.event(
+                    name,
+                    "llm_provider_required",
+                    "paused",
+                    {"task": exc.task, "reason": exc.reason},
+                    duration_ms=duration,
+                )
+                self.store.checkpoint(state)
+                self.state = state
+                return state
             except Exception as exc:
                 duration = (time.perf_counter() - started) * 1000
                 count = state["retry_counts"].get(name, 0) + 1
@@ -197,6 +260,18 @@ class Pipeline:
                     "message": str(exc),
                     "classification": self._classify_error(exc),
                 }
+                try:
+                    reflection = self._reflect(name, state["error"], state)
+                    if reflection:
+                        state["error"]["reflection"] = reflection
+                except ProviderReselectionRequired as llm_exc:
+                    if self.llm_service:
+                        self._record_llm_call(self.llm_service, state)
+                    self._pause_for_llm(
+                        state, llm_exc, name, self._resume_status_for_node(name), duration
+                    )
+                    self.state = state
+                    return state
                 self.store.event(
                     name,
                     "failure",
@@ -216,6 +291,64 @@ class Pipeline:
                 return state
 
         return wrapped
+
+    @staticmethod
+    def _resume_status_for_node(name: str) -> str:
+        return {
+            "discover": "initialized",
+            "plan": "questions_complete",
+            "preprocess": "plan_approved",
+            "validate_data": "preprocessed",
+            "eda": "data_valid",
+            "validate_results": "eda_complete",
+            "causal_specialist": "intermediate_approved",
+            "validate_specialist": "specialist_complete",
+            "report": "specialist_valid",
+        }[name]
+
+    def _reflect(
+        self, node: str, error: dict[str, Any], state: AnalysisState
+    ) -> dict[str, Any] | None:
+        if state.get("llm_provider", "deterministic") == "deterministic":
+            return None
+        service = self._require_llm("reflector")
+        result = service.generate(
+            "reflector",
+            {
+                "node": node,
+                "error_type": error["type"],
+                "deterministic_classification": error["classification"],
+            },
+            Reflection,
+        )
+        self._record_llm_call(service, state)
+        return result.model_dump(mode="json")
+
+    def _pause_for_llm(
+        self,
+        state: AnalysisState,
+        exc: ProviderReselectionRequired,
+        node: str,
+        resume_status: str,
+        duration_ms: float | None = None,
+    ) -> None:
+        state["status"] = "awaiting_llm_provider"
+        state["llm_status"] = "reselection_required"
+        state["llm_reselection_reason"] = exc.reason
+        state["pending_llm_operation"] = {
+            "task": exc.task,
+            "node": node,
+            "resume_status": resume_status,
+        }
+        state["active_nodes"] = []
+        self.store.event(
+            node,
+            "llm_provider_required",
+            "paused",
+            {"task": exc.task, "reason": exc.reason},
+            duration_ms=duration_ms,
+        )
+        self.store.checkpoint(state)
 
     @staticmethod
     def _classify_error(exc: Exception) -> str:
@@ -258,11 +391,39 @@ class Pipeline:
                 "notes": mismatches,
             }
         state["answers"] = {**extracted, **state.get("answers", {})}
-        pending = select_questions(state["answers"], self.settings.max_questions_per_round)
+        pending = self._select_questions(state, state["answers"])
         state["pending_questions"] = [item.model_dump(mode="json") for item in pending]
         self.store.write_json("questions/questions_v1.json", state["pending_questions"])
         state["status"] = "awaiting_questions" if pending else "questions_complete"
         return state
+
+    def _select_questions(
+        self, state: AnalysisState, answers: dict[str, dict[str, Any]]
+    ) -> list[Any]:
+        candidates = select_questions(answers, self.settings.max_questions_per_round)
+        if not candidates or state.get("llm_provider", "deterministic") == "deterministic":
+            return candidates
+        service = self._require_llm("question_planner")
+        profile = state.get("dataset_profile", {})
+        result = service.generate(
+            "question_planner",
+            {
+                "request": self._safe_request(state["user_request"]),
+                "dataset_metadata": self._profile_metadata(profile),
+                "answered_values": {key: value.get("value") for key, value in answers.items()},
+                "candidate_questions": [
+                    {"id": item.id, "category": item.category, "text": item.text}
+                    for item in candidates
+                ],
+            },
+            QuestionSelection,
+            allowed_ids={item.id for item in candidates},
+        )
+        self._record_llm_call(service, state)
+        by_id = {item.id: item for item in candidates}
+        ordered = [by_id[item] for item in result.question_ids]
+        ordered.extend(item for item in candidates if item.id not in result.question_ids)
+        return ordered[: self.settings.max_questions_per_round]
 
     @staticmethod
     def _documentation_mismatches(support: list[dict[str, Any]], columns: list[str]) -> list[str]:
@@ -382,7 +543,33 @@ class Pipeline:
                 outputs=["report/report_data.json", "report/report.md"],
             )
         )
+        proposed_ids: list[str] = []
+        used_ai_planner = state.get("llm_provider", "deterministic") != "deterministic"
+        if used_ai_planner:
+            service = self._require_llm("analysis_planner")
+            allowed = {step.id for step in steps}
+            proposal = service.generate(
+                "analysis_planner",
+                {
+                    "request": self._safe_request(state["user_request"]),
+                    "dataset_metadata": self._profile_metadata(state.get("dataset_profile", {})),
+                    "answers": {
+                        key: value.get("value") for key, value in state.get("answers", {}).items()
+                    },
+                    "allowed_tool_ids": sorted(allowed),
+                    "mandatory_tool_ids": [step.id for step in steps],
+                },
+                PlanProposal,
+                allowed_ids=allowed,
+            )
+            self._record_llm_call(service, state)
+            proposed_ids = proposal.tool_ids
         state["plan"] = [step.model_dump(mode="json") for step in steps]
+        if used_ai_planner:
+            priorities = {identifier: index for index, identifier in enumerate(proposed_ids, 1)}
+            for item in state["plan"]:
+                item["ai_selected"] = item["id"] in priorities
+                item["ai_priority"] = priorities.get(item["id"])
         self.store.write_json(f"plans/plan_v{state['plan_version']}.json", state["plan"])
         state["approval_status"] = "pending"
         state["status"] = "awaiting_plan_approval"
@@ -485,6 +672,27 @@ class Pipeline:
             [str(descriptive_path.resolve()), str(causal_path.resolve())]
             + [str(path.resolve()) for path in validation_paths],
         )
+        if state.get("llm_provider", "deterministic") != "deterministic":
+            evidence = self._report_evidence(report_data)
+            service = self._require_llm("reporter")
+            narrative = service.generate(
+                "reporter",
+                {
+                    "request": self._safe_request(state["user_request"]),
+                    "answers": {
+                        key: value.get("value") for key, value in state.get("answers", {}).items()
+                    },
+                    "evidence": evidence,
+                },
+                ReportNarrative,
+                allowed_evidence={item["id"] for item in evidence},
+            )
+            self._record_llm_call(service, state)
+            report_data["narrative"] = narrative.model_dump(mode="json")
+        report_data["llm"] = {
+            "provider": state.get("llm_provider", "deterministic"),
+            "model": state.get("llm_model", ""),
+        }
         data_path, report_path, html_path = save_report(report_data, self.store.root / "report")
         final = validate_final(data_path, report_path)
         final_path = self.store.write_json("validation/final_validation.json", final)
@@ -501,6 +709,70 @@ class Pipeline:
         )
         state["status"] = "complete"
         return state
+
+    def _require_llm(self, task: str) -> LLMService:
+        if self.llm_service is None:
+            message = "AI接続がこのプロセスにありません。再接続してください"
+            raise ProviderReselectionRequired(task, message)
+        return self.llm_service
+
+    @staticmethod
+    def _record_llm_call(service: LLMService, state: AnalysisState) -> None:
+        if service.last_audit_path:
+            state.setdefault("llm_calls", []).append(service.last_audit_path)
+
+    @staticmethod
+    def _safe_request(value: str) -> str:
+        value = re.sub(r"(?:[A-Za-z]:)?[/\\][^\s]+", "[PATH]", value)
+        return re.sub(r"\b[^\s]+\.(?:csv|xlsx)\b", "[DATASET]", value, flags=re.IGNORECASE)
+
+    @staticmethod
+    def _profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "format": profile.get("format"),
+            "size_bytes": profile.get("size_bytes"),
+            "estimated_rows": profile.get("estimated_rows"),
+            "sample_row_count": profile.get("sample_rows"),
+            "columns": profile.get("columns", []),
+            "dtypes": profile.get("sample_dtypes", {}),
+            "missing_counts": profile.get("sample_missing", {}),
+        }
+
+    @staticmethod
+    def _report_evidence(report: dict[str, Any]) -> list[dict[str, Any]]:
+        descriptive = report["descriptive"]
+        causal = report["causal_summary"]
+        evidence = [
+            {
+                "id": "descriptive.overview",
+                "kind": "aggregate",
+                "value": {
+                    "row_count": descriptive["row_count"],
+                    "column_count": descriptive["column_count"],
+                    "duplicate_rows": descriptive["duplicate_rows"],
+                    "missing_rate": descriptive.get("missing_rate", {}),
+                },
+            },
+            {
+                "id": "descriptive.numeric_summary",
+                "kind": "aggregate",
+                "value": descriptive.get("numeric_summary", []),
+            },
+            {"id": "causal.summary", "kind": "validated_result", "value": causal},
+            {
+                "id": "validation.results",
+                "kind": "validation",
+                "value": [
+                    {
+                        "rule_id": item["rule_id"],
+                        "passed": item["passed"],
+                        "reason": item["reason"],
+                    }
+                    for item in report["validations"]
+                ],
+            },
+        ]
+        return evidence
 
     def _invalidate_downstream(self) -> None:
         for key in ("causal_design", "report_path"):

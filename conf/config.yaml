@@ -8,6 +8,13 @@ random_seed: 42
 missing_strategy: keep
 duplicate_strategy: drop
 runs_dir: runs
+llm:
+  default_provider: deterministic
+  timeout_seconds: 120
+  max_attempts: 2
+  consent_policy_version: "1"
+  openrouter_base_url: https://openrouter.ai/api/v1
+  openai_base_url: https://api.openai.com/v1
 phase_weights:
   discovery: 10
   questions: 15
@@ -16,4 +23,3 @@ phase_weights:
   eda: 20
   specialist: 15
   reporting: 15
-
